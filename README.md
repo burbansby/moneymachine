@@ -14,38 +14,12 @@ pip install requests cryptography python-dotenv tabulate colorama
 
 ### 2. Generate your RSA key pair
 
-Kalshi uses RSA-PSS authentication. Generate a key and register the public half in your Kalshi account settings.
+Kalshi uses RSA-PSS authentication.
 
-```bash
-# Generate private key (keep this secret)
-openssl genrsa -out kalshi_private.pem 2048
+Go to Kalshi website to generate public and private key pair. Enter private key in kalshi_private.pem and enter your public key in credentials.json
 
-# Extract public key to upload to Kalshi
-openssl rsa -in kalshi_private.pem -pubout -out kalshi_public.pem
 
-# Upload kalshi_public.pem at:
-# https://kalshi.com/account/api-keys  (or demo.kalshi.com for demo)
-```
-
-### 3. Configure credentials
-
-Copy your API Key ID from the Kalshi dashboard and paste it into `config.json`:
-
-```json
-{
-  "key_id": "YOUR_KEY_ID_HERE",
-  "private_key_path": "kalshi_private.pem",
-  "demo": true
-}
-```
-
-Or use environment variables:
-```bash
-export KALSHI_KEY_ID="your_key_id"
-export KALSHI_PRIVATE_KEY_PATH="kalshi_private.pem"
-```
-
-### 4. Run the bot
+### 3. Run the bot
 
 ```bash
 # Safe start: paper trade on Kalshi's demo environment (default)
