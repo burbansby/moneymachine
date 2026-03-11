@@ -1,4 +1,8 @@
 {
+  "_comment": "Bot settings only — credentials go in credentials.json.",
+  "_longshot_comment": "Longshot: finds underpriced markets using real external data",
+  "longshot_enabled": true,
+
   "demo": false,
   "dry_run": false,
   "scan_only": false,
@@ -22,13 +26,21 @@
     "KXNBA", "KXNHL", "KXMLB", "KXUNEMP", "KXGDP",
     "KXOIL", "KXGOLD", "KXEUR", "KXJPY", "KXGBP",
     "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBABLK",
-    "KXNHLPTS", "KXNHLAST",
-    "KXMLBPTS", "KXMLBHR",
-    "KXPGA", "KXUFC",
-    "KXHOUSE", "KXMORT",
+    "KXNHLPTS", "KXNHLAST", "KXMLBPTS", "KXMLBHR",
+    "KXPGA", "KXUFC", "KXHOUSE", "KXMORT",
     "KXTRUMP", "KXCONGRESS"
   ],
 
   "profit_target_mult": 0.50,
-  "max_hold_hours": 24
+  "max_hold_hours": 24,
+
+  "longshot_min_edge": 0.15,
+  "longshot_max_price": 15,
+  "longshot_min_price": 1,
+  "longshot_series": [
+    "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBABLK",
+    "KXNHLPTS", "KXMLBPTS",
+    "HIGHNY", "HIGHCHI", "HIGHLA", "HIGHMIA", "HIGHBOS", "HIGHDAL",
+    "KXCPI", "KXUNEMP", "KXGDP", "KXMORT"
+  ]
 }

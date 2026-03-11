@@ -31,6 +31,7 @@ except ImportError:
 from kalshi_client import KalshiClient
 from strategy import (Signal, analyze_market, rank_signals)
 from risk import RiskConfig, RiskManager
+from longshot import check_longshot
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -221,6 +222,18 @@ class KalshiBot:
             "KXOIL", "KXGOLD", "KXEUR", "KXJPY",
         ])
 
+        # Add longshot-specific series if enabled
+        if self.cfg.get("longshot_enabled", False):
+            longshot_series = self.cfg.get("longshot_series", [
+                "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBABLK",
+                "KXNHLPTS", "KXMLBPTS", "HIGHNY", "HIGHCHI",
+                "HIGHLA", "HIGHMIA", "HIGHBOS",
+            ])
+            # Merge without duplicates
+            for s in longshot_series:
+                if s not in target_series:
+                    target_series = target_series + [s]
+
         for series in target_series:
             try:
                 resp = self.client.get_markets(
@@ -251,7 +264,14 @@ class KalshiBot:
                 sig = analyze_market(market, active_strategies)
                 if sig:
                     signals.append(sig)
-                    log.debug(f"  Signal: {sig}")
+
+                # Longshot strategy runs independently on same market data
+                if self.cfg.get("longshot_enabled", False):
+                    ls = check_longshot(market, self.cfg)
+                    if ls:
+                        signals.append(ls)
+                        log.info(f"  Longshot: {ls}")
+
                 scanned += 1
 
             time.sleep(0.2)
