@@ -1,0 +1,34 @@
+{
+  "demo": false,
+  "dry_run": false,
+  "scan_only": false,
+
+  "scan_interval_secs": 15,
+  "monitor_interval_secs": 5,
+  "max_markets_per_scan": 150,
+
+  "max_position_pct": 0.10,
+  "max_exposure_pct": 0.60,
+  "kelly_scale": 0.50,
+
+  "min_edge": 0.02,
+  "min_confidence": 0.30,
+  "max_daily_loss_pct": 0.15,
+
+  "strategies": ["ARBS", "SPREAD", "DRIFT", "VALUE"],
+
+  "target_series": [
+    "KXBTC", "KXETH", "KXINX", "KXFED", "KXCPI",
+    "KXNBA", "KXNHL", "KXMLB", "KXUNEMP", "KXGDP",
+    "KXOIL", "KXGOLD", "KXEUR", "KXJPY", "KXGBP",
+    "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBABLK",
+    "KXNHLPTS", "KXNHLAST",
+    "KXMLBPTS", "KXMLBHR",
+    "KXPGA", "KXUFC",
+    "KXHOUSE", "KXMORT",
+    "KXTRUMP", "KXCONGRESS"
+  ],
+
+  "profit_target_mult": 0.50,
+  "max_hold_hours": 24
+}
