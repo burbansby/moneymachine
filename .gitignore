@@ -1,0 +1,6 @@
+__pycache__/*
+credentials.json
+kalshi_bot.log
+kalshi_private.pem
+open_positions.json
+trade_log.jsonl
