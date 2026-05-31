@@ -1,25 +1,49 @@
 {
   "_comment": "Bot settings only — credentials go in credentials.json.",
-  "_longshot_comment": "Longshot: finds underpriced markets using real external data",
-  "longshot_enabled": true,
+  "_safety": "Set demo to true to paper-trade. Start there before going live.",
 
   "demo": false,
   "dry_run": false,
   "scan_only": false,
 
-  "scan_interval_secs": 15,
-  "monitor_interval_secs": 5,
-  "max_markets_per_scan": 150,
+  "scan_interval_secs": 30,
+  "monitor_interval_secs": 15,
+  "_scan_note": "scan_all_markets=false scans only target_series (fast, historically where trades came from). Set true to paginate EVERY open market (~600k, slow). max_markets_per_scan=0 means no cap.",
+  "scan_all_markets": false,
+  "max_markets_per_scan": 0,
 
   "max_position_pct": 0.10,
   "max_exposure_pct": 0.60,
   "kelly_scale": 0.50,
 
-  "min_edge": 0.02,
+  "min_edge": 0.01,
   "min_confidence": 0.30,
   "max_daily_loss_pct": 0.15,
 
-  "strategies": ["ARBS", "SPREAD", "DRIFT", "VALUE"],
+  "_value_note": "PRIMARY strategy (valuation.py): buys markets priced modestly below their calibrated historical fair value, expecting reversion. Skips trending markets (wide anchor range), big gaps (=news, not noise), and untraded markets. value_sharpen=favorite-longshot correction (1.0=off).",
+  "value_enabled": true,
+  "value_min_obs": 5,
+  "value_ema_alpha": 0.35,
+  "value_sharpen": 1.10,
+  "value_min_gap_cents": 3,
+  "value_max_gap_cents": 12,
+  "value_min_edge": 0.03,
+  "value_max_edge": 0.40,
+  "value_min_price": 5,
+  "value_max_price": 95,
+  "value_min_volume": 50,
+  "value_max_anchor_range_cents": 10,
+  "value_confidence": 0.50,
+  "history_path": "price_history.json",
+  "history_max_obs": 288,
+  "history_min_interval_secs": 300,
+
+  "_strategies_note": "Analytic per-market strategies. ARBS=risk-free bonus. SPREAD/DRIFT/MOMENTUM/FAVORITE=directional heuristics (off by default now that VALUE is primary).",
+  "strategies": ["ARBS"],
+
+  "_event_arb_note": "Risk-free multi-leg detector; logs to arb_alerts.jsonl, does not auto-trade.",
+  "event_arb_enabled": true,
+  "event_arb_min_cents": 2,
 
   "target_series": [
     "KXBTC", "KXETH", "KXINX", "KXFED", "KXCPI",
@@ -34,6 +58,7 @@
   "profit_target_mult": 0.50,
   "max_hold_hours": 24,
 
+  "longshot_enabled": true,
   "longshot_min_edge": 0.15,
   "longshot_max_price": 15,
   "longshot_min_price": 1,

@@ -1,7 +1,17 @@
+# secrets
 credentials.json
 kalshi_private.pem
+
+# runtime / generated data
 kalshi_bot.log
 trade_log.jsonl
+arb_alerts.jsonl
 open_positions.json
+price_history.json
+
+# local diagnostic scripts
+probe*.py
+
+# python
 __pycache__/
 *.pyc

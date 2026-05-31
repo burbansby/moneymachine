@@ -129,36 +129,46 @@ class RiskManager:
     # ── Position sizing ─────────────────────────────────────────────────────
 
     def size_position(self, signal: Signal) -> int:
-        """Returns number of contracts to buy (0 = don't trade)."""
+        """Returns number of contracts to buy (0 = don't trade).
+
+        All money values are in cents. `signal.market_price` is the cost per
+        contract (for ARBS it is the combined cost of one YES+NO pair).
+        """
         balance = self.state.balance_cents
-        if balance <= 0:
+        price = signal.market_price
+        if balance <= 0 or price <= 0:
             return 0
 
-        # Kelly-based sizing
-        kf = kelly_fraction(signal.fair_value, signal.market_price, self.cfg.kelly_scale)
+        # Caps shared by every strategy ---------------------------------------
+        # Per-position dollar cap.
+        max_pos_cents = balance * self.cfg.max_position_pct
+        cap_position = int(max_pos_cents / price)
 
-        # Hard cap by max_position_pct
-        max_dollars = balance * self.cfg.max_position_pct / 100.0   # in contracts
-        kelly_contracts = int(kf * (balance / 100.0) / (signal.market_price / 100.0))
-
-        # Remaining exposure headroom
+        # Remaining portfolio-exposure headroom.
         exposure = self.current_exposure_cents()
-        max_exp = balance * self.cfg.max_exposure_pct
-        remaining_cents = max(0, max_exp - exposure)
-        max_from_exposure = int(remaining_cents / signal.market_price)
+        remaining_cents = max(0, balance * self.cfg.max_exposure_pct - exposure)
+        cap_exposure = int(remaining_cents / price)
+
+        if signal.strategy == "ARBS":
+            # Risk-free: Kelly is undefined (infinite), so size purely by the
+            # position / exposure / per-trade caps.
+            kelly_contracts = self.cfg.max_contracts_per_trade
+        else:
+            kf = kelly_fraction(signal.fair_value, price, self.cfg.kelly_scale)
+            kelly_contracts = int(kf * balance / price)
+            if kelly_contracts <= 0:
+                return 0   # Kelly says no bet — don't force a minimum
 
         contracts = min(kelly_contracts,
-                        int(max_dollars),
-                        max_from_exposure,
+                        cap_position,
+                        cap_exposure,
                         self.cfg.max_contracts_per_trade)
-        contracts = max(self.cfg.min_contracts, contracts)
 
-        if contracts * signal.market_price > balance * self.cfg.max_position_pct:
-            contracts = int(balance * self.cfg.max_position_pct / signal.market_price)
+        if contracts < self.cfg.min_contracts:
+            return 0   # can't even afford the minimum within caps
 
-        contracts = max(0, contracts)
-        log.debug(f"Size: kelly={kelly_contracts} cap={int(max_dollars)} "
-                  f"exp={max_from_exposure} → {contracts} contracts")
+        log.debug(f"Size {signal.ticker}: kelly={kelly_contracts} "
+                  f"pos_cap={cap_position} exp_cap={cap_exposure} → {contracts}")
         return contracts
 
     def stop_loss_price(self, entry_price: float) -> float:

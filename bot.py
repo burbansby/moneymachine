@@ -29,9 +29,10 @@ except ImportError:
     pass
 
 from kalshi_client import KalshiClient
-from strategy import (Signal, analyze_market, rank_signals)
+from strategy import (Signal, analyze_market, rank_signals, check_event_arb)
 from risk import RiskConfig, RiskManager
 from longshot import check_longshot
+from valuation import PriceTracker, check_value as check_value_signal
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -70,15 +71,18 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    # Environment
-    "demo": False,
+    # Environment — default to the demo (paper) environment for safety.
+    "demo": True,
     "dry_run": False,
     "scan_only": False,
 
     # Scan settings
-    "scan_interval_secs": 15,
-    "monitor_interval_secs": 5,
-    "max_markets_per_scan": 150,
+    "scan_interval_secs": 60,
+    "monitor_interval_secs": 30,
+    # scan_all_markets=True paginates the entire open-market universe (~600k
+    # markets, slow). False = only the target_series list (fast). Default False.
+    "scan_all_markets": False,
+    "max_markets_per_scan": 0,        # 0 = no cap
 
     # Risk parameters
     "max_position_pct": 0.10,
@@ -88,8 +92,35 @@ DEFAULT_CONFIG = {
     "min_confidence": 0.30,
     "max_daily_loss_pct": 0.15,
 
-    # Strategies
-    "strategies": ["ARBS", "SPREAD", "DRIFT", "VALUE"],
+    # PRIMARY strategy: historical-mispricing / mean-reversion value engine
+    # (valuation.py). Buys markets cheap relative to their calibrated fair value.
+    "value_enabled": True,
+    "value_min_obs": 5,
+    "value_ema_alpha": 0.35,
+    "value_sharpen": 1.10,
+    "value_min_gap_cents": 3,
+    "value_max_gap_cents": 12,
+    "value_min_edge": 0.03,
+    "value_max_edge": 0.40,
+    "value_min_price": 5,
+    "value_max_price": 95,
+    "value_min_volume": 50,
+    "value_max_anchor_range_cents": 10,
+    "value_confidence": 0.50,
+    "history_path": "price_history.json",
+    "history_max_obs": 288,
+    "history_min_interval_secs": 300,
+
+    # Analytic per-market strategies. ARBS is risk-free; the others are
+    # directional heuristics. ARBS kept on as a free bonus alongside VALUE.
+    "strategies": ["ARBS"],
+
+    # Event-level arbitrage detector (risk-free; alerts only, never auto-trades).
+    "event_arb_enabled": True,
+    "event_arb_min_cents": 2,
+
+    # Don't let reconcile drop a position younger than this (anti-churn safety).
+    "reconcile_grace_secs": 120,
 
     # Exit
     "profit_target_mult": 0.50,
@@ -206,79 +237,239 @@ class KalshiBot:
         self.cycle = 0
         self.signals_found = 0
         self.trades_placed = 0
+        # Primary engine: per-market price history for the VALUE strategy.
+        self.prices = PriceTracker(cfg)
 
     # ── Market scan ───────────────────────────────────────────────────────
+
+    # Default series used only when scan_all_markets is False.
+    DEFAULT_SERIES = [
+        "KXBTC", "KXETH", "KXINX", "KXFED", "KXCPI",
+        "KXNBA", "KXNHL", "KXMLB", "KXUNEMP", "KXGDP",
+        "KXOIL", "KXGOLD", "KXEUR", "KXJPY",
+    ]
+    DEFAULT_LONGSHOT_SERIES = [
+        "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBABLK",
+        "KXNHLPTS", "KXMLBPTS", "HIGHNY", "HIGHCHI",
+        "HIGHLA", "HIGHMIA", "HIGHBOS",
+    ]
+
+    def _fetch_all_open_markets(self, cap: int) -> List[dict]:
+        """Paginate the full set of open markets (cursor-based). cap<=0 = no cap."""
+        markets: List[dict] = []
+        cursor = None
+        pages = 0
+        while True:
+            try:
+                resp = self.client.get_markets(limit=1000, cursor=cursor,
+                                               status="open")
+            except Exception as e:
+                log.error(f"get_markets (all) failed on page {pages+1}: {e}")
+                break
+            batch = resp.get("markets", [])
+            markets.extend(batch)
+            pages += 1
+            cursor = resp.get("cursor") or ""
+            if cap > 0 and len(markets) >= cap:
+                markets = markets[:cap]
+                break
+            if not cursor or not batch:
+                break
+            time.sleep(0.2)
+        log.info(f"  Fetched {len(markets)} open markets across {pages} page(s)")
+        return markets
+
+    def _fetch_series_markets(self, cap: int) -> List[dict]:
+        """Fetch markets only for the configured target/longshot series."""
+        target_series = list(self.cfg.get("target_series", self.DEFAULT_SERIES))
+        if self.cfg.get("longshot_enabled", False):
+            for s in self.cfg.get("longshot_series", self.DEFAULT_LONGSHOT_SERIES):
+                if s not in target_series:
+                    target_series.append(s)
+
+        markets: List[dict] = []
+        for series in target_series:
+            try:
+                resp = self.client.get_markets(limit=200, status="open",
+                                               series_ticker=series)
+            except Exception as e:
+                log.error(f"get_markets failed for {series}: {e}")
+                continue
+            markets.extend(resp.get("markets", []))
+            if cap > 0 and len(markets) >= cap:
+                markets = markets[:cap]
+                break
+            time.sleep(0.2)
+        log.info(f"  Fetched {len(markets)} markets across "
+                 f"{len(target_series)} series")
+        return markets
+
+    def _fetch_market_universe(self) -> List[dict]:
+        cap = int(self.cfg.get("max_markets_per_scan", 0) or 0)
+        if self.cfg.get("scan_all_markets", False):
+            return self._fetch_all_open_markets(cap)
+        return self._fetch_series_markets(cap)
 
     def scan_markets(self) -> List[Signal]:
         log.info(f"── Scanning markets (cycle {self.cycle}) ──")
         signals = []
+        all_markets = []          # liquid markets only, for event-level arb
         scanned = 0
+        liquid = 0                # markets with a tradeable book (yes_ask>0)
+        has_volume = 0            # markets with any 24h volume
+        value_warming = 0         # VALUE markets still in history warm-up
         active_strategies = set(self.cfg["strategies"])
+        longshot_on = self.cfg.get("longshot_enabled", False)
+        value_on = self.cfg.get("value_enabled", True)
+        min_obs = int(self.cfg.get("value_min_obs", 4))
+        now = datetime.now(timezone.utc)
+        live_tickers = set()
+        sample_market = None
 
-        # Target series known to have liquidity
-        target_series = self.cfg.get("target_series", [
-            "KXBTC", "KXETH", "KXINX", "KXFED", "KXCPI",
-            "KXNBA", "KXNHL", "KXMLB", "KXUNEMP", "KXGDP",
-            "KXOIL", "KXGOLD", "KXEUR", "KXJPY",
-        ])
-
-        # Add longshot-specific series if enabled
-        if self.cfg.get("longshot_enabled", False):
-            longshot_series = self.cfg.get("longshot_series", [
-                "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBABLK",
-                "KXNHLPTS", "KXMLBPTS", "HIGHNY", "HIGHCHI",
-                "HIGHLA", "HIGHMIA", "HIGHBOS",
-            ])
-            # Merge without duplicates
-            for s in longshot_series:
-                if s not in target_series:
-                    target_series = target_series + [s]
-
-        for series in target_series:
-            try:
-                resp = self.client.get_markets(
-                    limit=50, status="open", series_ticker=series
-                )
-            except Exception as e:
-                log.error(f"get_markets failed for {series}: {e}")
+        for market in self._fetch_market_universe():
+            ticker = market.get("ticker", "")
+            if not ticker:
                 continue
+            scanned += 1
+            if sample_market is None:
+                sample_market = market
 
-            for market in resp.get("markets", []):
-                ticker = market.get("ticker", "")
-                if not ticker:
-                    continue
+            # Cheap liquidity gate: skip the huge tail of dead micro-markets
+            # before doing any work. A market with no ask can't be arbed or
+            # bought, so it's useless to us regardless of strategy.
+            if (market.get("yes_ask", 0) or 0) <= 0 and (market.get("no_ask", 0) or 0) <= 0:
+                continue
+            liquid += 1
+            live_tickers.add(ticker)
+            if market.get("volume_24h", 0) > 0:
+                has_volume += 1
 
-                # Skip markets closing in < 5 min
-                close_ts = market.get("close_time", "")
-                if close_ts:
-                    try:
-                        close_dt = datetime.fromisoformat(
-                            close_ts.replace("Z", "+00:00"))
-                        mins_left = (close_dt - datetime.now(timezone.utc)
-                                     ).total_seconds() / 60
-                        if mins_left < 5:
-                            continue
-                    except Exception:
-                        pass
+            all_markets.append(market)
 
-                sig = analyze_market(market, active_strategies)
-                if sig:
-                    signals.append(sig)
+            # Record price into the rolling history (down-sampled internally).
+            if value_on:
+                self.prices.record(market)
 
-                # Longshot strategy runs independently on same market data
-                if self.cfg.get("longshot_enabled", False):
-                    ls = check_longshot(market, self.cfg)
-                    if ls:
-                        signals.append(ls)
-                        log.info(f"  Longshot: {ls}")
+            # Skip markets closing in < 5 min
+            close_ts = market.get("close_time", "")
+            if close_ts:
+                try:
+                    close_dt = datetime.fromisoformat(
+                        close_ts.replace("Z", "+00:00"))
+                    if (close_dt - now).total_seconds() / 60 < 5:
+                        continue
+                except Exception:
+                    pass
 
-                scanned += 1
+            # PRIMARY strategy: historical-mispricing / mean-reversion value.
+            if value_on:
+                hist = self.prices.history(ticker)
+                if len(hist) < min_obs:
+                    value_warming += 1
+                else:
+                    vs = check_value_signal(market, hist, self.cfg)
+                    if vs:
+                        signals.append(vs)
+                        log.info(f"  Value: {vs}  ({vs.extra})")
 
-            time.sleep(0.2)
+            # Per-market analytic strategies (ARBS + optional heuristics).
+            sig = analyze_market(market, active_strategies)
+            if sig:
+                signals.append(sig)
+
+            # Model-based longshots run independently on the same market data.
+            if longshot_on:
+                ls = check_longshot(market, self.cfg)
+                if ls:
+                    signals.append(ls)
+                    log.info(f"  Longshot: {ls}")
+
+        # Event-level arbitrage runs across the liquid universe.
+        self.detect_event_arbs(all_markets)
+
+        # Persist + prune the price history once per scan.
+        if value_on:
+            self.prices.prune(live_tickers)
+            self.prices.save()
 
         self.signals_found += len(signals)
-        log.info(f"  Scanned {scanned} markets → {len(signals)} signals")
+        warm = f", {value_warming} VALUE warming up" if value_warming else ""
+        log.info(f"  Scanned {scanned} markets ({liquid} with a book, "
+                 f"{has_volume} with 24h volume{warm}) → {len(signals)} signals")
+
+        # Health check: we fetched markets but none were tradeable. This almost
+        # always means the API response shape changed (e.g. price fields renamed)
+        # and normalization in kalshi_client needs updating. Warn with a sample
+        # so it can't fail silently. Throttled to avoid log spam.
+        if scanned > 0 and liquid == 0 and sample_market is not None \
+                and self.cycle % 20 == 1:
+            sample = {k: sample_market.get(k) for k in
+                      ("ticker", "yes_ask", "no_ask", "last_price", "volume_24h")}
+            log.warning(f"  No tradeable markets in {scanned} fetched — "
+                        f"possible API field change. Sample: {sample}")
+
         return rank_signals(signals)
+
+    # ── Event-level arbitrage (detector / alerter) ─────────────────────────
+
+    def detect_event_arbs(self, all_markets: List[dict]):
+        """
+        Group scanned markets by event and flag mutually-exclusive events whose
+        YES prices over-round (sum above 100¢) — buying NO on every leg is then
+        risk-free. This DETECTS and ALERTS only; it does not place the multi-leg
+        order automatically (a partial fill across many legs is unsafe). Acted
+        opportunities are written to arb_alerts.jsonl.
+        """
+        if not self.cfg.get("event_arb_enabled", True):
+            return
+
+        from collections import defaultdict
+        by_event = defaultdict(list)
+        for m in all_markets:
+            et = m.get("event_ticker", "")
+            if et:
+                by_event[et].append(m)
+
+        min_cents = self.cfg.get("event_arb_min_cents", 2)
+        for event_ticker, mkts in by_event.items():
+            if len(mkts) < 2:
+                continue
+            opp = check_event_arb(mkts, min_cents)
+            if not opp:
+                continue
+            # The arb only holds if the outcomes are mutually exclusive — verify
+            # against Kalshi before trusting it.
+            if not self._event_is_exclusive(event_ticker):
+                continue
+            self._alert_event_arb(event_ticker, opp)
+
+    def _event_is_exclusive(self, event_ticker: str) -> bool:
+        try:
+            resp = self.client.get_event(event_ticker)
+        except Exception as e:
+            log.debug(f"  get_event failed {event_ticker}: {e}")
+            return False
+        ev = resp.get("event", resp)
+        return bool(ev.get("mutually_exclusive", False))
+
+    def _alert_event_arb(self, event_ticker: str, opp: dict):
+        msg = (f"EVENT ARB {event_ticker}: buy NO on {opp['n']} legs for "
+               f"${opp['total_cost']/100:.2f} → guaranteed "
+               f"${opp['guaranteed_profit']/100:.2f} "
+               f"({opp['profit_per_dollar']*100:.1f}% of capital)")
+        log.warning(f"{BOLD}{YELLOW}*** {msg} ***{RESET}")
+        for tkr, no_ask in opp["legs"]:
+            log.warning(f"      NO {tkr} @ {no_ask:.0f}¢")
+        record = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "event_ticker": event_ticker,
+            **opp,
+        }
+        try:
+            with open("arb_alerts.jsonl", "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            log.debug(f"  could not write arb_alerts.jsonl: {e}")
 
     # ── Position persistence ──────────────────────────────────────────────
 
@@ -323,9 +514,23 @@ class KalshiBot:
             log.warning(f"Reconcile failed — could not fetch positions: {e}")
             return
 
-        # Remove positions the bot thinks are open but Kalshi says are closed
+        # Remove positions the bot thinks are open but Kalshi says are closed.
+        #
+        # SAFETY GRACE PERIOD: never drop a position we opened in the last
+        # `reconcile_grace_secs` seconds. A freshly placed order may not yet be
+        # reflected by the positions endpoint (fill/settlement lag), and a parse
+        # mismatch here previously caused the bot to delete its own brand-new
+        # positions, lose the duplicate-guard, and re-buy the same tickers in a
+        # fee-burning loop. The grace period makes that impossible.
+        grace = self.cfg.get("reconcile_grace_secs", 120)
         for ticker in list(self.positions.keys()):
             if ticker not in kalshi_positions:
+                pos = self.positions[ticker]
+                age = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
+                if age < grace:
+                    log.info(f"RECONCILE: {ticker} not on Kalshi yet but only "
+                             f"{age:.0f}s old (< {grace}s grace) — keeping")
+                    continue
                 log.warning(f"RECONCILE: {ticker} not found on Kalshi — removing from bot")
                 del self.positions[ticker]
 
@@ -382,9 +587,18 @@ class KalshiBot:
             self.trades_placed += 1
             return True
 
+        if signal.strategy == "ARBS":
+            return self._execute_arb(signal, contracts)
+        return self._execute_single(signal, contracts)
+
+    @staticmethod
+    def _order_id(ticker: str, tag: str = "") -> str:
+        import hashlib
+        raw = f"{ticker}{tag}{time.time_ns()}"
+        return f"bot_{hashlib.md5(raw.encode()).hexdigest()[:10]}"
+
+    def _execute_single(self, signal: Signal, contracts: int) -> bool:
         try:
-            import hashlib
-            uid = hashlib.md5(f"{signal.ticker}{int(time.time())}".encode()).hexdigest()[:8]
             resp = self.client.place_order(
                 ticker=signal.ticker,
                 side=signal.side,
@@ -392,7 +606,7 @@ class KalshiBot:
                 count=contracts,
                 price_cents=int(signal.market_price),
                 order_type="limit",
-                client_order_id=f"bot_{uid}",
+                client_order_id=self._order_id(signal.ticker),
             )
             order_id = resp.get("order", {}).get("order_id", "")
             pos = OpenPosition(signal, contracts, order_id)
@@ -405,6 +619,56 @@ class KalshiBot:
         except Exception as e:
             log.error(f"  Order failed for {signal.ticker}: {e}")
             return False
+
+    def _execute_arb(self, signal: Signal, contracts: int) -> bool:
+        """
+        Place both legs of a single-market arbitrage (buy YES + buy NO). Both
+        legs must fill for the position to be risk-free. If the second leg
+        fails, immediately try to unwind the first so we never sit on a naked
+        directional position.
+        """
+        yes_ask = int(signal.extra.get("yes_ask", 0))
+        no_ask = int(signal.extra.get("no_ask", 0))
+        if yes_ask <= 0 or no_ask <= 0:
+            log.error(f"  ARB {signal.ticker}: missing leg prices — skip")
+            return False
+
+        try:
+            r1 = self.client.place_order(
+                ticker=signal.ticker, side="yes", action="buy",
+                count=contracts, price_cents=yes_ask, order_type="limit",
+                client_order_id=self._order_id(signal.ticker, "y"))
+        except Exception as e:
+            log.error(f"  ARB {signal.ticker}: YES leg failed ({e}) — no position opened")
+            return False
+
+        try:
+            self.client.place_order(
+                ticker=signal.ticker, side="no", action="buy",
+                count=contracts, price_cents=no_ask, order_type="limit",
+                client_order_id=self._order_id(signal.ticker, "n"))
+        except Exception as e:
+            log.error(f"  ARB {signal.ticker}: NO leg failed ({e}) — unwinding YES leg")
+            try:
+                self.client.place_order(
+                    ticker=signal.ticker, side="yes", action="sell",
+                    count=contracts, price_cents=max(1, yes_ask - 1),
+                    order_type="limit")
+            except Exception as e2:
+                log.critical(f"  ARB {signal.ticker}: UNWIND FAILED ({e2}) — "
+                             f"NAKED YES x{contracts} @ {yes_ask}c, MANUAL ACTION NEEDED")
+            return False
+
+        order_id = r1.get("order", {}).get("order_id", "")
+        pos = OpenPosition(signal, contracts, order_id)
+        self.positions[signal.ticker] = pos
+        self.trades_placed += 1
+        net = signal.extra.get("net_profit", 0)
+        log.info(f"  ARB legs placed: YES@{yes_ask}c + NO@{no_ask}c x{contracts} "
+                 f"-> locked ~${net*contracts/100:.2f} at settlement")
+        self._log_trade("OPEN", signal, contracts, order_id)
+        self.save_positions()
+        return True
 
     # ── Position monitoring & exit ─────────────────────────────────────────
 
@@ -420,6 +684,9 @@ class KalshiBot:
                 log.error(f"  monitor error {ticker}: {e}")
 
     def _check_exit(self, ticker: str, pos: OpenPosition):
+        # Arbitrage positions hold both legs to settlement — never exit early.
+        if pos.signal.strategy == "ARBS":
+            return
         try:
             market_resp = self.client.get_market(ticker)
         except Exception as e:
@@ -460,12 +727,13 @@ class KalshiBot:
             self._exit_position(ticker, pos, current_bid)
 
     def _exit_position(self, ticker: str, pos: OpenPosition, exit_price: float):
-        del self.positions[ticker]
-        self.save_positions()
-
         if self.dry_run or self.scan_only:
+            del self.positions[ticker]
+            self.save_positions()
             return
 
+        # Place the sell first; only forget the position once it's accepted, so
+        # a failed exit order doesn't orphan a live position.
         try:
             self.client.place_order(
                 ticker=ticker,
@@ -475,10 +743,14 @@ class KalshiBot:
                 price_cents=int(exit_price),
                 order_type="limit",
             )
-            self._log_trade("CLOSE", pos.signal, pos.contracts, "",
-                            entry=pos.entry_price, exit_p=exit_price)
         except Exception as e:
-            log.error(f"  Exit order failed {ticker}: {e}")
+            log.error(f"  Exit order failed {ticker}: {e} — keeping position for retry")
+            return
+
+        self._log_trade("CLOSE", pos.signal, pos.contracts, "",
+                        entry=pos.entry_price, exit_p=exit_price)
+        del self.positions[ticker]
+        self.save_positions()
 
     def _log_trade(self, action: str, signal: Signal, contracts: int,
                    order_id: str, entry: float = None, exit_p: float = None):
@@ -625,6 +897,29 @@ def main():
         private_key_pem=private_key_pem,
         demo=cfg.get("demo", False),
     )
+
+    # Preflight auth check — fail fast with a clear message instead of looping
+    # on "Portfolio refresh error: 401".
+    env = "DEMO" if cfg.get("demo", False) else "LIVE"
+    try:
+        client.get_balance()
+        log.info(f"Auth OK ({env})")
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 401:
+            print(f"{RED}{BOLD}ERROR: Kalshi rejected your credentials (401) on the "
+                  f"{env} environment.{RESET}")
+            print("Kalshi's DEMO and LIVE accounts use SEPARATE API keys.")
+            print("  • For --demo: generate a key at https://demo.kalshi.co "
+                  "(Account → API Keys)")
+            print("  • For live:   generate a key at https://kalshi.com")
+            print("Then put the matching key_id in credentials.json and the "
+                  "private key in kalshi_private.pem.")
+            print("If the key is correct, verify your system clock is accurate "
+                  "(requests are signed with a timestamp).")
+            sys.exit(1)
+        # Non-auth error (network, etc.) — let the run loop's retry logic handle it.
+        log.warning(f"Preflight balance check failed ({env}): {e}")
 
     risk_cfg = RiskConfig(
         max_position_pct=cfg["max_position_pct"],
