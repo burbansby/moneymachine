@@ -122,7 +122,10 @@ DEFAULT_CONFIG = {
     # Don't let reconcile drop a position younger than this (anti-churn safety).
     "reconcile_grace_secs": 120,
 
-    # Exit
+    # Exit — risk-managed: cut losers fast, let winners run via a trailing stop.
+    "exit_max_loss_cents": 8,           # hard stop: max loss per contract (¢)
+    "exit_trail_activate_cents": 3,     # start trailing once up this many ¢
+    "exit_trail_give_back_cents": 3,    # exit if bid falls this far from peak
     "profit_target_mult": 0.50,
     "max_hold_hours": 24,
 }
@@ -167,7 +170,14 @@ class OpenPosition:
         self.entry_time = datetime.now(timezone.utc)
         self.entry_price = signal.market_price
         self.target_price = signal.target_exit_cents
+        # NOTE: the actual stop / trailing-stop is computed in _check_exit from
+        # config so risk/reward stays symmetric. stop_price is kept only as a
+        # display/persistence field; it is no longer the catastrophic
+        # entry×0.4 (60% loss) it used to be.
         self.stop_price = max(1.0, signal.market_price * 0.4)
+        # High-water mark of the best bid seen since entry — drives the
+        # trailing stop that lets winners run instead of selling for pennies.
+        self.peak_price = signal.market_price
         self.unrealized_pnl_cents = 0
 
     def hours_held(self) -> float:
@@ -192,6 +202,7 @@ class OpenPosition:
             "entry_price": self.entry_price,
             "target_price": self.target_price,
             "stop_price": self.stop_price,
+            "peak_price": self.peak_price,
         }
 
     @classmethod
@@ -212,8 +223,9 @@ class OpenPosition:
         pos = cls(sig, d["contracts"], d["order_id"])
         pos.entry_time = datetime.fromisoformat(d["entry_time"])
         pos.entry_price = d["entry_price"]
-        pos.target_price = d["target_price"]
-        pos.stop_price = d["stop_price"]
+        pos.target_price = d.get("target_price", pos.target_price)
+        pos.stop_price = d.get("stop_price", pos.stop_price)
+        pos.peak_price = d.get("peak_price", pos.entry_price)
         return pos
 
     def __str__(self):
@@ -711,10 +723,38 @@ class KalshiBot:
         hours = pos.hours_held()
         reasons = []
 
-        if current_bid >= pos.target_price:
-            reasons.append(f"TARGET  {current_bid:.0f}¢ >= {pos.target_price:.0f}¢")
-        if current_bid <= pos.stop_price:
-            reasons.append(f"STOP  {current_bid:.0f}¢ <= {pos.stop_price:.0f}¢")
+        # ── Risk-managed exit (cut losers fast, let winners run) ──────────────
+        # Update the high-water mark of the best bid since entry.
+        if current_bid > pos.peak_price:
+            pos.peak_price = current_bid
+
+        max_loss = float(self.cfg.get("exit_max_loss_cents", 8))
+        trail_act = float(self.cfg.get("exit_trail_activate_cents", 3))
+        trail_give = float(self.cfg.get("exit_trail_give_back_cents", 3))
+
+        # Hard stop: never lose more than `exit_max_loss_cents` per contract.
+        # Replaces the old entry*0.4 (~60% loss) stop that let losers run.
+        hard_stop = max(1.0, pos.entry_price - max_loss)
+
+        # Trailing stop: once up at least `trail_act`, exit if the bid falls
+        # `trail_give` from its peak — lets a winner keep running instead of
+        # being dumped at the tiny fixed profit target.
+        trailing_stop = None
+        if pos.peak_price - pos.entry_price >= trail_act:
+            trailing_stop = pos.peak_price - trail_give
+
+        effective_stop = hard_stop
+        if trailing_stop is not None:
+            effective_stop = max(hard_stop, trailing_stop)
+        pos.stop_price = effective_stop  # keep display/persistence in sync
+
+        if current_bid <= effective_stop:
+            kind = ("TRAIL" if trailing_stop is not None
+                    and effective_stop == trailing_stop else "STOP")
+            reasons.append(f"{kind}  {current_bid:.0f}c <= {effective_stop:.0f}c "
+                           f"(peak {pos.peak_price:.0f}c)")
+        elif current_bid >= 97:
+            reasons.append(f"TAKE_PROFIT  {current_bid:.0f}c >= 97c")
         if hours >= self.cfg["max_hold_hours"]:
             reasons.append(f"MAX_HOLD  {hours:.1f}h >= {self.cfg['max_hold_hours']}h")
 

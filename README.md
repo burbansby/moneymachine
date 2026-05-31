@@ -224,16 +224,26 @@ Other guards:
 
 ### Exit Logic (non‑arb positions)
 
-A non‑arb position is closed when **any** trigger hits, checked every
-`monitor_interval_secs`:
+Exits are **risk‑managed to cut losers fast and let winners run** (the opposite
+of the old fixed tiny‑target / 60%‑stop logic, which lost far more on a single
+loser than it made on many winners). Checked every `monitor_interval_secs`, a
+non‑arb position is closed when **any** trigger hits:
 
-1. **Profit target** — current best bid ≥ the strategy's `target_exit_cents`.
-2. **Stop loss** — current best bid ≤ `entry_price × 0.4` (60% loss).
-3. **Time limit** — held longer than `max_hold_hours`.
+1. **Hard stop** — best bid ≤ `entry − exit_max_loss_cents`. Caps the loss per
+   contract (default 8¢) instead of riding it down 60%.
+2. **Trailing stop** — once the bid has risen at least `exit_trail_activate_cents`
+   above entry, the position exits if the bid falls `exit_trail_give_back_cents`
+   from its peak. This lets a winner keep climbing rather than being dumped at a
+   few cents of profit.
+3. **Take‑profit** — best bid ≥ 97¢ (don't hold a near‑resolved winner for a
+   last penny of risk).
+4. **Time limit** — held longer than `max_hold_hours`.
 
-The exit order is placed **before** the position is removed from tracking, so a
-failed exit leaves the position in place to retry rather than orphaning it.
-`ARBS` positions are exempt — both legs are held to settlement.
+With the defaults a 45¢ entry caps its loss at ~37¢ (−8¢) but a winner that runs
+to 60¢ trails out near 57¢ (+12¢) — so wins can exceed losses. The exit order is
+placed **before** the position is removed from tracking, so a failed exit leaves
+the position in place to retry rather than orphaning it. `ARBS` positions are
+exempt — both legs are held to settlement.
 
 ### Persistence & Reconciliation
 
@@ -277,6 +287,9 @@ failed exit leaves the position in place to retry rather than orphaning it.
 | `event_arb_enabled` | `true` | Run the `EVENT_ARB` detector (alerts only) |
 | `event_arb_min_cents` | `2` | Minimum guaranteed profit (¢) to alert on |
 | `target_series` | see file | Series scanned by default (when `scan_all_markets` is false) |
+| `exit_max_loss_cents` | `8` | Hard stop: max loss per contract (¢) |
+| `exit_trail_activate_cents` | `3` | Start trailing once up this many ¢ |
+| `exit_trail_give_back_cents` | `3` | Exit if bid falls this far from its peak |
 | `max_hold_hours` | `24` | Force‑exit non‑arb positions after this |
 | `longshot_enabled` | `true` | Run the longshot engine |
 | `longshot_min_edge` | `0.15` | Required edge over market price |
@@ -289,7 +302,7 @@ failed exit leaves the position in place to retry rather than orphaning it.
 
 > Note: `profit_target_mult`, `max_single_loss_pct`, and `min_orderbook_volume`
 > exist in the config/code but are not currently wired into the trading loop.
-> Exit targets come from each strategy's own `target_exit_cents`.
+> Exits are governed by the hard/trailing stop above, not `target_exit_cents`.
 
 ---
 

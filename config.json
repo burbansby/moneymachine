@@ -55,6 +55,10 @@
     "KXTRUMP", "KXCONGRESS"
   ],
 
+  "_exit_note": "Cut losers fast, let winners run. Hard stop caps loss at exit_max_loss_cents; once up exit_trail_activate_cents a trailing stop exits if the bid drops exit_trail_give_back_cents from its peak.",
+  "exit_max_loss_cents": 8,
+  "exit_trail_activate_cents": 3,
+  "exit_trail_give_back_cents": 3,
   "profit_target_mult": 0.50,
   "max_hold_hours": 24,
 
